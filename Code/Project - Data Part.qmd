@@ -1,0 +1,478 @@
+---
+title: "Project - Data part"
+author: "Alexander Koehler"
+format:
+  html:
+    highlight: espresso
+    code-copy: true
+    df-print: paged
+    number-sections: true
+    toc: true
+    toc_depth: 3
+    toc_float: yes
+execute: 
+  cache: true
+  warning: false
+fontsize: 11pt
+---
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(tidyfinance)
+library(scales)
+library(RSQLite)
+library(dbplyr)
+library(RPostgres)
+```
+
+# Project - Data part
+
+# Downloading Campustat Data and funamentals example (no need to run)
+
+The following code illustrates how one would download the campustat data. This part of the code is not needed to run as due to download limitations we use the dataset provided in the drop box.
+
+```{r}
+# Creating link
+wrds <- dbConnect(
+  Postgres(),
+  host = "wrds-pgdata.wharton.upenn.edu",
+  dbname = "wrds",
+  port = 9737,
+  sslmode = "require",
+  user = "alexanderkoehle",
+  password = "hDZa#aQ4cB7fZ.z"
+)
+
+# The data has been previously collected this way:
+funda_db <- tbl(wrds, in_schema("comp", "funda"))
+
+# Setting the analysis horizon
+start_date <- lubridate::ymd("2000-01-01")
+end_date <- lubridate::ymd("2023-06-30")
+```
+
+## Example of downloading data using data link
+
+```{r}
+#| code-fold: show
+ccmxpf_linktable_db <- tbl(
+  wrds,
+  in_schema("crsp", "ccmxpf_linktable")
+)
+
+ccmxpf_linktable <- ccmxpf_linktable_db %>%
+  filter(linktype %in% c("LU", "LC") &
+    linkprim %in% c("P", "C") &
+    usedflag == 1) %>%
+  select(permno = lpermno, gvkey, linkdt, linkenddt) %>%
+  collect() %>%
+  mutate(linkenddt = replace_na(linkenddt, today()))
+
+# for only the first 1000 rows to limit data download
+#We then select three particular companies from Compustat:
+acc <- funda_db %>%
+  filter(datadate >= start_date & datadate <= end_date) %>%
+  select(gvkey, conm, fyear, fdate, fyr, datadate, at, wcap, re, ebit, lt, sale, dlc, uxintd, uxinst, dltt, seq, pstkc, csho, che) %>% 
+  mutate(WCTA = wcap / at,
+         RETA = re / at,
+         EBTA = ebit / at,
+         TLTA = lt / at, 
+         SLTA = sale / at,
+         Leverage = (dltt + dlc) / seq,
+         Total_Equity = pstkc + csho,
+         Cash_Holdings = che / at) %>%
+  head(1000) |>
+  collect()
+```
+
+dlc (debt in current liliabilities), uxintd (interest on long-term debt), uxinst (short-term), dltt (long term debt), seq (stock holders equity), csho (share count), che (Cash Holdings). Sadly these variables were not present in the provided dataset and due to download limitations, we were not able to add them to the data set. We referenced: [https://www.wiwi.uni-muenster.de/uf/sites/uf/files/2017_10_12_wrds_data_items.pdf](extension://efaidnbmnnnibpcajpcglclefindmkaj/https://www.wiwi.uni-muenster.de/uf/sites/uf/files/2017_10_12_wrds_data_items.pdf)
+
+### getting company data for dldte, dlrsn
+
+```{r}
+company_db <- tbl(wrds, in_schema("comp", "company"))
+
+ccmxpf_linktable_db <- tbl(
+  wrds,
+  in_schema("crsp", "ccmxpf_linktable")
+)
+
+ccmxpf_linktable <- ccmxpf_linktable_db %>%
+  filter(linktype %in% c("LU", "LC") &
+    linkprim %in% c("P", "C") &
+    usedflag == 1) %>%
+  select(permno = lpermno, gvkey, linkdt, linkenddt) %>%
+  collect() %>%
+  mutate(linkenddt = replace_na(linkenddt, today()))
+
+#| code-fold: show
+comp <- company_db %>% 
+  select(gvkey, dldte, dlrsn) %>% 
+  collect()
+
+saveRDS(comp, "../data/campustat_comp.rds")
+```
+
+# Merge accounting data with company info from compustat
+
+Here the actual part of the code begins.
+
+```{r}
+# Load downloaded
+acc <- readRDS('../data/wrds_data/compustat_all.rds')
+
+acc <- acc |>  select(gvkey, conm, fyear, fdate, fyr, datadate, at, wcap, re, ebit, lt, sale) %>% 
+  mutate(WCTA = wcap / at,
+         RETA = re / at,
+         EBTA = ebit / at,
+         TLTA = lt / at, 
+         SLTA = sale / at) |>
+  filter(fyear >= 2000)
+
+# we only keep companies with fiscal year >= 2000 to limit our sample to the more recent datapoints
+
+head(acc)
+```
+
+We merge the company fundamental data with the balance sheet data to get our merged dataframe for the compustat data. With this we will subsequently be able to add on the lopucki bankrupty data which contains richer information for companies that went bankrupt and then later stock market data for the companies to improve our prediction for bankruptcy. We directly create our Y == 1 variable with the lopucki dataset due to the compustat\$dlrsn not being a consistent example, as can be seen with "Eastman Kodak" below.
+
+```{r}
+comp <- readRDS("../data/campustat_comp.rds")
+
+compustat <- acc |>
+  left_join(comp, by = c("gvkey"), relationship = "many-to-many")
+
+saveRDS(compustat, "../data/campustat_merged.rds")
+```
+
+```{r}
+# Eastman Kodak bankruptcy example. the compustat data does not give any indication of bankruptcy.
+compustat |> filter(grepl('KODAK', conm), fyear >=2010, fyear <= 2014) |>
+  select(conm, gvkey, fyear, fyr, datadate, fdate, dldte, dlrsn)
+```
+
+The columns for deletion date and deletion reason are empty, as compustat never stopped reporting the data, as shown in the guidance document provided by the teacher.
+
+The following file gives an overview of all the variables used
+
+```{r}
+compustat_funda_variables <- readRDS('../data/wrds_data/compustat_funda_variables.rds')
+head(compustat_funda_variables)
+```
+
+## Merging with Lopucki
+
+First we read the merged comustat data:
+
+```{r}
+compustat <- readRDS("../data/campustat_merged.rds")
+```
+
+We load and clean the lopucki bankruptcy data, following the teacher's code.
+
+```{r}
+#| code-fold: show
+
+lopucki <- readxl::read_xlsx(
+    "../data/Bankruptcy - LoPucki/Florida-UCLA-LoPucki Bankruptcy Research Database 1-12-2023.xlsx")
+
+# Some companies fill multiple time (eg American Apparel) with ultimately 224/2 duplicate candidates, we will filter these out
+lopucki %>%
+  group_by(GvkeyBefore) %>%
+  mutate(n=n()) %>%
+  ungroup() %>%
+  filter(n>1)
+```
+
+```{r}
+#| code-fold: show
+# Extract Chapter 7/11
+# When multiple filings for a company (ie gvkey) you can select the min date (bankruptcy filings sometimes occur multiple times spanning up to a 10 year period)
+lopucki_clean <- lopucki %>%
+    select(NameCorp, Chapter, GvkeyBefore, DateFiled) %>%
+    filter(Chapter %in% c('7', '11')) %>% 
+    group_by(GvkeyBefore) %>% 
+    summarize(DateFiled = min(DateFiled),
+              NameCorp = NameCorp[which.min(DateFiled)],
+              Chapter = Chapter[which.min(DateFiled)]) %>% 
+    mutate(DateFiled = lubridate::as_date(DateFiled)) %>% 
+    ungroup()
+```
+
+### Now we have a cleaner Lopucki data set
+
+Using the field `GvkeyBefore` we are able to match Compustat. In our clean dataset we have 1071 entries, of which, 764 have gvkeys that match the compustat data.
+
+```{r}
+#| code-fold: show
+  
+gvkey_merged <- compustat %>% pull(gvkey) |> unique()
+
+lopucki_clean %>% filter(GvkeyBefore %in% gvkey_merged)
+```
+
+Compustat deleted ENRON CORP from its database in 2005, but oddly, only data until the year 2000 is contained, we will subsequently remove observations such as these to improve our model performance. We do not want our Y == 1 for these observations.
+
+```{r}
+compustat |> filter(grepl('ENRON CORP', conm)) |>
+  select(conm, gvkey, fyear, fyr, datadate, fdate, dldte, dlrsn)
+```
+
+We give an overview of the defaulted companies in the Lopucki database
+
+```{r}
+#| code-fold: show
+
+gvkey_defaulted <- lopucki_clean |> pull(GvkeyBefore)
+
+compustat %>% filter(gvkey %in% gvkey_defaulted) %>% select(gvkey, conm, dldte, dlrsn) |> unique()
+
+print(sum(is.na(compustat %>% filter(gvkey %in% gvkey_defaulted) %>% select(gvkey, conm, dldte, dlrsn) |> unique() |> select(dlrsn))))
+```
+
+As we can see, a substantial number of companies in the Lopucki dataset do not have a dlrsn. in fact, there are 116 potential cases which would not have been recorded as a bankruptcy case had we not use the Lopucki data.
+
+With the following code giving us an overview of all the data available for the defaulted companies
+
+```{r}
+compustat %>%
+  filter(gvkey %in% gvkey_defaulted, fyear > 2000) %>%
+  select(gvkey, conm, datadate, fyear, fdate)
+```
+
+### Merging Compustat & Lopucki
+
+Merging Lopucki with compustat & CRSP data, if no bankruptcy is present then set to 0
+
+```{r}
+#| code-fold: show
+
+# lopucki_clean
+# renaming gvkey_before in lopucki for merge
+lopucki_clean <- lopucki_clean |> rename(gvkey = GvkeyBefore)
+
+df_merged <- compustat %>%
+  left_join(lopucki_clean, by = c("gvkey"), relationship = "many-to-many")
+
+rm(lopucki, lopucki_clean, compustat)
+```
+
+## Building Y
+
+from the df above, we see the variable "DateFiled" contains the date that the company went bankrupt. thus, as we define our Y to be equal to 1 when the firm will go bankrupt the next year , we define Y=1 when the "date" so CRSP data data is 1 year before the actual bankruptcy is filed.
+
+```{r}
+df_merged |>
+    mutate(
+    fyear = as.Date(fyear),
+    DateFiled = as.Date(DateFiled)
+  )
+
+# Step 1: Extract the year from 'date' and 'DateFiled'
+df_merged <- df_merged %>%
+  mutate(
+    year_filed = year(DateFiled)
+  ) |>
+  mutate(Y = ifelse(fyear == year_filed - 1, 1, 0))
+```
+
+To simplify our analysis for now, we also remove all data of a company after the year of default to not over train our model
+
+We illustrate our Y building using the example of American airlines
+
+```{r}
+# view(df_merged |> filter(gvkey == "004194")) for EASTMAN KODAK
+# American Airlines
+df_merged |> filter(gvkey == "001045", fyear > 2008, fyear < 2015)
+```
+
+To Y variables, we replace NA's with 0 and filter out entries with missing balance sheet data, as we do not want to include any companies that have no balance sheet data at all.
+
+```{r}
+df_merged <- df_merged |> filter(!is.na(re),!is.na(ebit),!is.na(re),!is.na(lt))
+
+df_merged <- df_merged |>
+  mutate(Y = replace_na(Y,0))
+
+head(df_merged)
+# saveRDS(df_merged, "../data/df_merged.rds")
+```
+
+# Adding CRSP data
+
+### Loading CRSP Data
+
+We now add CRSP Data to our merged Compustat and Lopucki Data frame
+
+As we are only considering data for the years after 2000, we can filter out any stock market data for the years \< 1999 to limit the size of the data. We focus our study on the defaults in approximately the last 25 years.
+
+```{r}
+
+# df_merged <- readRDS("../data/df_merged.rds")
+# Due to download time considerations, we use the provided dataset. Limiting our analysis to after 2000
+df_CRSP <- readRDS('../data/wrds_data/crsp_daily.rds') |> filter(year(date) >= 2000) 
+head(df_CRSP)
+```
+
+### Function to calculate rolling 12 month averages, on a 252 working day basis.
+
+we want to simplify the database to only include the yearly volatility, which we will add to our fundamental data #we keep volatility of share price last 12 months and market cap data + average bid-ask spread of last 12 months
+
+Extracting the "datadates" of all the different companies. these will be used to calculate the rolling 12 month averages.
+
+we define the quoted spread as follows:
+
+$\displaystyle {\text{Quoted Spread}}={\frac {{\hbox{ask}}-{\hbox{bid}}}{\hbox{midpoint}}}\times 100$.
+
+```{r}
+# Function to calculate rolling statistics, note Chat GPT was used to help avoid using an external package
+rolling_stats <- function(stock_data, window_days = 252) {
+  # Group data by gvkey
+  stock_data <- stock_data %>%
+    group_by(permno) %>%
+    arrange(date) %>%
+    mutate(
+      # Rolling standard deviation for `close`
+      rolling_volatility = sapply(1:n(), function(i) {
+        idx <- max(1, i - window_days + 1):i
+        sd(close[idx], na.rm = TRUE)
+      }),
+      # Rolling average bid-ask spread
+      avg_bid_ask_spread = sapply(1:n(), function(i) {
+        idx <- max(1, i - window_days + 1):i
+        mean(((ask[idx] - bid[idx])/((ask[idx] - bid[idx])/2 + bid[idx])) * 100, na.rm = TRUE)
+      }),
+      # Rolling average market cap
+      avg_market_cap = sapply(1:n(), function(i) {
+        idx <- max(1, i - window_days + 1):i
+        mean(cap[idx], na.rm = TRUE)
+      })
+    ) %>%
+    ungroup()
+  
+  return(stock_data)
+}
+
+# Fill missing values using Last Observation Carried Forward (LOCF)
+fill_na_locf <- function(x) {
+  non_na_index <- !is.na(x)          # Identify non-NA values
+  x[non_na_index][cumsum(non_na_index)]  # Carry forward the last observation
+}
+```
+
+### Mapping table
+
+To minimise the computational time, we will only calculate the rolling statistics for dates that are actually needed for the respective companies. for this we already need to use the mapping table to get the respective "permno" identifiers as this is the unique identifier we can merge the compustat data with the CRSP data. Using this mapping data frame, we can extract all the unique dates per company used (the day of their fiscal data) and thus only add the missing dates to the CRSP data and then fill in the gaps using the most recent previous data.
+
+Additionally, with the filtering applied on subset_mapping, we remove entries not listed on the stock market. Thus, taking American Airlines as an example, after the company's bankruptcy in 2012, it was subsequently de-listed from the stock market. After $Y==1$ in $fyear == 2011$ the 2012 entry is removed to diminish the risk of overfitting our models on already bankrupt companies. As American Airlines was re-listed in $2013-12-09$, $fyear == 2013$ is included in our data frame again and we consider the company as "new" with $Y == 0$.
+
+```{r}
+#| code-fold: show
+
+(subset_mapping <- ccmxpf_linktable %>%
+  filter(gvkey %in% unique(df_merged$gvkey)) %>% 
+  left_join(df_merged, by = c("gvkey")))
+
+# to avoid duplicate date we only keep companies with an end linking date > 1999. If we do not do this, we repeat companies that were listed twice or did some sort of transformation. See american airlines 1950 to 1962 linkenddt and then 1962 to 2024, with this condition we avoid having these rows twice.
+subset_mapping <- subset_mapping |> filter(!is.na(permno) & !is.na(gvkey) & (datadate >= linkdt & datadate <= linkenddt))
+
+head(subset_mapping |> filter(gvkey == "001045"))
+
+# to free up memory, no longer needed
+rm(df_merged)
+```
+
+### Computation of rolling statistics for needed dates
+
+```{r}
+# Step 1: Calculate the rolling statistics
+df_CRSP <- rolling_stats(df_CRSP) |> drop_na()
+#we drop the first date as no vol is available
+
+# Use group_by to process data per gvkey
+df_CRSP <- df_CRSP %>%
+  group_by(permno) %>%
+  do({
+    # Ensure date column is available within the group context
+    current_data <- .
+    
+    # For each group, identify missing dates from subset_mapping
+    missing_dates <- setdiff(subset_mapping$datadate[subset_mapping$permno == unique(current_data$permno)], current_data$date)
+    
+    # Check if there are missing dates to add
+    if (length(missing_dates) > 0) {
+      # Create new rows for the missing dates
+      missing_rows <- data.frame(
+        permno = unique(current_data$permno),
+        date = as.Date(missing_dates),  # Ensure the 'date' column is of Date type
+        value = NA  # Adjust to other columns as needed
+      )
+      
+      # Bind the missing rows to the original group and return it
+      bind_rows(current_data, missing_rows)
+    } else {
+      # If no missing dates, return the original group unchanged
+      current_data
+    }
+  }) %>%
+  # Ensure the final data is sorted by permno and date
+  arrange(permno, date)
+
+# As some the fiscal data date "datadate" references the end of months and these can be weekends, we fill the missing gaps of the stock market data, taking the most recent previous data point for the missing dates to ensure that the subsequent merge does not miss data due to the stock market data not alligning / being closed on that day.
+
+# Apply LOCF for each column
+columns_to_fill <- c("cusip", "permno","rolling_volatility","avg_bid_ask_spread","avg_market_cap")
+for (col in columns_to_fill){
+  df_CRSP <- df_CRSP |> fill(col)
+}
+
+#rename date column to prepare for merge
+df_CRSP <- df_CRSP |> rename(datadate = date)
+# saveRDS(df_CRSP, '../data/df_CRSP.rds')
+```
+
+### Merging
+
+Given the previously generated mapping table, we can use this data frame to merge with our CRSP data containing the needed rolling 12 month statistics and market cap at the data date.
+
+```{r}
+df <- subset_mapping %>%
+  left_join(df_CRSP |> select(permno, datadate, rolling_volatility, avg_bid_ask_spread, avg_market_cap), by = c("permno", "datadate"), relationship = "many-to-many")
+
+# To free up memory we remove the pre-merge datasets
+rm(subset_mapping, df_CRSP)
+```
+
+now we have financial data for the whole year, per given FY end, so if the FY / BS data is from 12-2023, we have the daily financial data for 2024 as this data is first available in 2024.
+
+we now have a database with equity market data in addition to the fundamental data for the companies
+
+# Adding Treasury yield data
+
+```{r}
+df_1yr_treasury <- readRDS('../data/treasury_1Y.rds')
+```
+
+We merge on a day to day basis, filling in gaps
+
+```{r}
+df_1yr_treasury <- df_1yr_treasury |> filter(year(DATE) > 1999)
+
+# Adding missing dates
+complete_dates <- data.frame(
+  DATE = seq(min(df_1yr_treasury$DATE), max(df_1yr_treasury$DATE), by = "day") # Create a sequence from min to max date
+)
+df_1yr_treasury <- merge(complete_dates, df_1yr_treasury, by = "DATE", all.x = TRUE)
+
+# fill with previous value
+df_1yr_treasury <- df_1yr_treasury |> fill(VALUE) |> rename("datadate" = "DATE") |> rename("treasury_1Y" = "VALUE")
+
+# merging with main dataframe
+df <- df |> left_join(df_1yr_treasury, by = c("datadate"), relationship = "many-to-many")
+rm(complete_dates, subset_mapping, df_CRSP, df_1yr_treasury)
+
+#Saving the final dataset
+saveRDS(df, '../data/df.rds')
+```
+
+With this our final data set is created, in the "Project - Scoring_models.qmd" file we additionally fill in data gaps and subsequently run the different models. Please continue with the named file.

@@ -1,0 +1,304 @@
+---
+title: TSE - Scoring Project
+subtitle: Introduction
+format: clean-revealjs
+html-math-method:
+  method: mathjax
+  url: "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"
+author:
+  - name: Louis Olive
+    email: louis.olive@gmail.com / louis.olive@ut-capitole.fr
+date: last-modified
+---
+
+## Syllabus - Project (groups composition due 16 Oct)
+
+- Credit risk case study. 
+
+- Part A: Using real life data sources, a set of tasks to perform in group (9, 16, 23 Oct, a short report tracking current code/analysis due for next week class):
+    - Defining the problem / Building the data set [Getting /Cleansing/Enriching Data] / Exploration / Baseline model
+    - Implementing ideas from academic literature on credit risk (feature engineering) / (Model evaluation pipeline with tidymodels)
+    - Advanced topics: "applied" gradient boosting, model (re)calibration, PDP/SHAP
+
+## Syllabus - Project
+
+- Part B: In parallel a selection of topics will be proposed to the students with the goal to assess alternative methods (projects choice due 23 Oct): 
+    - the reading of selected papers,
+    -	the understanding of the methods or algorithms at stake (if necessary the students will re-implement from scratch a simplified version, develop intuition on toy data sets, give short proofs / overview of key results),
+    -	the implementation of the methods on the real life data set,
+    -	the assessment of the method,
+    -	the writing of a final report summarizing/finalizing part A / implementing part B (intermediary discussion 6 Nov, final project reports due 17 Nov 23:59).
+
+- Part C: A final presentation (group/one-to-one meeting, 20 Nov).
+
+
+## The exam
+### A simplified / anonymized data set
+
+Bankruptcy prediction data set related to public US companies spanning 1987-2015.
+
+Testing set spanning 2016-2019.
+
+Simplified, cleansed, non-default event undersampled.
+
+## Today
+### Build your own data set
+
+- Build you own data set from scratch
+
+- Make assumptions
+
+- Check data quality, especially the event of interest: the default
+
+- Build your own data set from scratch
+
+
+## The data at hand {.scrollable}
+
+In principle, most bankruptcies ([Chapter 7](https://en.wikipedia.org/wiki/Chapter_7,_Title_11,_United_States_Code)/ [Chapter 11](https://en.wikipedia.org/wiki/Chapter_11,_Title_11,_United_States_Code)) in the U.S. between 1960 and 2023 for publicly listed companies.
+
+In practice, many bankruptcies are lacking, other default events (payment default, distressed debt) non tracked.
+
+Predictors:
+
+-   Firm accounting data from Compustat (S&P). For US and Canadian companies, annual history is available back to 1950 and quarterly as well as monthly histories date back to 1962.
+
+-   US stocks data from the Center for Research in Security Prices (CRSP).
+
+-   Both sources (Compustat/CRSP) available through the Wharton Research Data Services (WRDS). Possible to link Compustat/CRSP. 
+WRDS is one of the most widely used source for asset and financial data used in academic setting. Subscribed by UT Capitole.
+
+## WRDS {.scrollable}
+
+For access to the data, register with your `ut-capitole` email. Go to this url: <https://wrds-www.wharton.upenn.edu/register/>
+
+![](images/wrds_register.png){width="1442"}
+
+## WRDS {.scrollable}
+
+It takes roughly a week to be validated by `ut-capitole` teams.
+
+![](images/wrds_accepted.png){width="1385"}
+
+## WRDS with R {.scrollable}
+
+https://www.tidy-finance.org/r/wrds-crsp-and-compustat.html
+
+```{r, message=FALSE, warning=FALSE}
+#| echo: true
+
+library(tidyverse)
+library(dbplyr)
+library(RPostgres)
+# First create two environment variables to connect wrds
+# in a terminal: touch $HOME/.Renviron
+# inside the .Renviron file
+# wrds_user = your_user
+# wrds_password = your_password
+
+wrds <- dbConnect(
+    Postgres(),
+    host = "wrds-pgdata.wharton.upenn.edu",
+    dbname = "wrds",
+    port = 9737,
+    sslmode = "require",
+    user = Sys.getenv("wrds_user"),
+    password = Sys.getenv("wrds_password")
+)
+
+compustat_list <- dbListObjects(wrds, Id(schema = "comp"))
+
+# Use dplyr verbs with a remote database table
+# https://dbplyr.tidyverse.org/reference/tbl.src_dbi.html
+funda_db <- tbl(wrds, in_schema("comp", "funda"))
+funda_db %>%
+  filter(grepl('APPLE INC', conm)) %>%
+  select(gvkey, fyear, conm, at, wcap, re, ebit, lt, sale) %>%
+  mutate(WCTA = wcap / at,
+         RETA = re / at,
+         EBTA = ebit / at,
+         TLTA  = lt / at, # as a proxy for ME/TL
+         SLTA = sale / at)
+```
+
+## Default definition - Bank for International Settlements (BIS) {.scrollable}
+
+In order to estimate a dynamic logit model, we need an indicator of financial distress / default and a set of predictors.
+
+![](images/default_definition_BIS.png)
+
+The indicator equals one in a month in which a firm filed for bankruptcy under Chapter 7 or Chapter 11, and zero otherwise; in particular, the indicator is zero if the firm disappears from the data set for some reason other than bankruptcy such as acquisition or delisting.
+
+
+## Default data - Literature - Shumway, T. (2001) {.scrollable}
+
+![](images/shumway_default1.png){width="808"}
+![](images/shumway_default2.png){width="808"}
+
+
+## Default data - Literature - Chava, S. and Jarrow, R. (2004) {.scrollable}
+
+![](images/chava_default1.png)
+![](images/chava_default2.png)
+## Default data - Literature - Campbell, J. Y. al. (2008). {.scrollable}
+
+![](images/campbell_default.png)
+
+## Default data - Literature - Christoffersen, B. (2019).  {.scrollable}
+
+![](images/christoffersen_default1.png)
+
+![](images/christoffersen_default2.png)
+
+
+## Default data - LoPucki {.scrollable}
+
+![](images/lopucki.png)
+
+The Florida-UCLA-LoPucki Bankruptcy Research Database (BRD): data collection and linking, promote bankruptcy research by making bankruptcy data available to academic researchers throughout the world.
+
+![](images/lopucki_data.png)
+
+## Default data - Moody's Annual default Study {.scrollable}
+
+![](images/moodys_default_report.png){width="1559"}
+Data spans 2002-2022, including chapter 11, chapter 7, distressed exchange, missed interest payment and/or a missed principal payment.
+
+![](images/moodys_default_report_list.png)
+
+
+## Classical literature about bankruptcy  {.scrollable}
+
+-   Altman, E. I. (1968). Financial Ratios, Discriminant Analysis and the Prediction of Corporate Bankruptcy. (using LDA / introducing Z-score)
+
+-   Ohlson, J. A. (1980). Financial Ratios and the Probabilistic Prediction of Bankruptcy. (using Logistic Regression / O-score)
+
+-   Shumway, T. (2001). Forecasting Bankruptcy More Accurately: A Simple Hazard Model. (using Logistic Regression / Hazard model with firm-year observation)
+
+-   Chava, S. and Jarrow, R. (2004). Bankruptcy Prediction with Industry Effects. (Hazard model using Industry Effects)
+
+-   Bharath, S. T., Shumway, T. (2008). Forecasting Default with the Merton Distance to Default Model. (using Structural model a la Merton/KMV as a predictor) 
+
+-   Christoffersen, B. (2019). Corporate Default Models: Empirical Evidence and Methodological Contributions. Copenhagen Business School [Phd]
+
+- Summary:
+![](images/moodys_empirical.png)
+
+## Feature engineering
+
+-   Compustat: Yearly vs Quarterly financial data
+
+-   Thorough work on default definition: data (Lopucki/Moody's), horizon
+
+-   Financial Ratio ## Predictors (see [here](https://wrds-www.wharton.upenn.edu/documents/793/WRDS_Industry_Financial_Ratio_Manual.pdf), [here for SAS code](https://wrds-www.wharton.upenn.edu/pages/support/manuals-and-overviews/wrds-financial-ratios/financial-ratios-sas-code/) translated to R [here](https://gist.github.com/196sigma/b200631b7cab24dc427b23e926f0cb7e)
+
+- Add market/time series variables (CRSP, FRED)
+
+
+
+
+
+
+
+-   Industry, Macro, Market data (e.g. stock data CRSP)
+
+## About the importance of thorough data collection {.scrollable}
+
+https://www.risk.net/awards/7955909/lifetime-achievement-award-stephen-kealhofer
+
+![](images/kealhofer1.png)
+![](images/kealhofer2.png)
+
+![](images/kealhofer3.png)
+
+## Selected practitioner literature about bankruptcy
+
+-   Falkenstein, E. and Boral, A. and Carty, L. (2000) Riskcalc for Private Companies: Moody's Default Model. 
+
+-   Lewis, Susan. (2004) BondScore 3.0: A Credit Risk Model for Corporate Debt Issuers.
+
+-   Bardos, M. (2007) What is at stake in the construction and use of credit scores?
+
+## Part B - Linear Discriminant Analysis (LDA)
+
+Theory:
+
+-   R.A. Fisher (1936). The use of multiple measurements in taxonomic problems. Annals of Eugenics 7: 179--188.
+
+-   Efron, B. (1975). The Efficiency of Logistic Regression Compared to Normal Discriminant Analysis. Journal of the American Statistical Association, 70(352), 892--898. https://doi.org/10.2307/2285453
+
+Implementation Toy model: https://sthalles.github.io/fisher-linear-discriminant/
+
+Application to Scoring/Default prediction:
+
+-   Bardos, M. (1998). Detecting the risk of company failure at the Banque de France, Journal of Banking & Finance, Elsevier, vol. 22(10-11), pages 1405-1419, October.
+
+-   Bardos, M. (2007) What is at stake in the construction and use of credit scores?. Comput Econ 29, 159--172.
+
+## Part B - Lasso
+
+Theory:
+
+-   Tibshirani, R. (1996). Regression shrinkage and selection via the lasso. J. Royal. Statist. Soc B., Vol. 58, No. 1, pages 267-288).
+
+-   Friedman, J. H., Hastie, T., & Tibshirani, R. (2010). Regularization Paths for Generalized Linear Models via Coordinate Descent. Journal of Statistical Software, 33(1), 1--22. https://doi.org/10.18637/jss.v033.i01
+
+-   Yang, Y., Zou, H. (2015) A fast unified algorithm for solving group-lasso penalize learning problems. Stat Comput 25, 1129--1141. https://doi.org/10.1007/s11222-014-9498-5
+
+Application to Scoring/Default prediction:
+
+-   Christoffersen, B. (2019). Corporate Default Models: Empirical Evidence and Methodological Contributions. Copenhagen Business School [Phd]
+
+## Part B - Generalized Additive Models (GAM)
+
+Theory:
+
+-   Hastie, T., & Tibshirani, R. (1986). Generalized Additive Models. Statistical Science, 1(3), 297--310. http://www.jstor.org/stable/2245459
+
+-   Hastie T., Tibshirani R. and Friedman. J. (2009) The Elements of Statistical Learning: Data Mining, Inference and Prediction, Springer. Sections 5.6 Nonparametric Logistic Regression / 9.1 Generalized Additive Models
+
+Application to Scoring/Default prediction:
+
+-   Falkenstein, E. and Boral, A. and Carty, L. (2000) Riskcalc for Private Companies: Moody's Default Model. https://ssrn.com/abstract=236011
+
+-   Christoffersen, B. (2019). Corporate Default Models: Empirical Evidence and Methodological Contributions. Copenhagen Business School [Phd]
+
+## Part B - LogitBoost / Gradient Boosting
+
+Theory:
+
+-   Freund, Y., Schapire, R.E. (1997) A decision-theoretic generalization of on-line learning and an application to boosting. Journal of Computer and System Sciences 55(1), 119--139 (Adaboost)
+
+-   Friedman, J. H. & Hastie, T. & Tibshirani, R. (2000) Additive Logistic Regression - A Statistical View of Boosting. The Annals of Statistics. 28. 337-407 (LogitBoost)
+
+-   Friedman, J. H. (2001). Greedy Function Approximation: A Gradient Boosting Machine. The Annals of Statistics, 29(5), 1189--1232. http://www.jstor.org/stable/2699986 (Gradient Boosting)
+
+-   Hastie T., Tibshirani R. and Friedman. J. (2009) The Elements of Statistical Learning: Data Mining, Inference and Prediction, Springer. Chapter 10 Boosting and Additive Trees, Sections 10.1-10.6
+
+Application to Scoring/Default prediction:
+
+-   Christoffersen, B. (2019). Corporate Default Models: Empirical Evidence and Methodological Contributions. Copenhagen Business School [Phd]
+
+## Market based approach
+
+Theory:
+
+-   Merton, R. C. (1974) On the Pricing of Corporate Debt: The Risk Structure of Interest Rates. The Journal of Finance, 29(2), 449–470. https://doi.org/10.2307/2978814
+
+-   Campbell, J. and Hilscher, J. and Szilagyi, J. (2008) In Search of Distress Risk. Harvard Institute of Economic Research Discussion Paper No. 2081, Available at SSRN: https://ssrn.com/abstract=770805
+
+-   Bharath, S. T., & Shumway, T. (2008). Forecasting Default with the Merton Distance to Default Model, The Review of Financial Studies, Volume 21, Issue 3, May 2008, Pages 1339–1369, https://doi.org/10.1093/rfs/hhn044
+
+Application to Scoring/Default prediction:
+
+-   Sobehart, J. and R. Stein (2000) - Moody’s Public Firm Risk Model- A Hybrid Approach to to Modeling Short Term Default Risk https://riskcalc.moodysrms.com/us/research/crm/53853.pdf
+
+-   Christoffersen, B. (2019). Corporate Default Models: Empirical Evidence and Methodological Contributions. Copenhagen Business School [Phd]
+
+## General Reference
+
+Hastie T., Tibshirani R. and Friedman. J. (2009) The Elements of Statistical Learning: Data Mining, Inference and Prediction, Springer. (https://hastie.su.domains/ElemStatLearn/printings/ESLII_print12_toc.pdf)
+
+
+
+

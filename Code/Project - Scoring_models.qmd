@@ -1,0 +1,1057 @@
+---
+title: "Models scoring"
+author: "Guillaume and Alexander"
+format: html
+editor: visual
+---
+
+# Data Preparation
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(scales)
+library(RSQLite)
+library(dbplyr)
+library(RPostgres)
+library(randomForest)
+library(glmnet)
+library(ROCR)
+library(dplyr)
+library(tidyr)
+library(pROC)
+library(caret)
+
+# Load data
+df <- readRDS('../data/df.rds')
+
+# Handle -inf and NA values
+df <- data.frame(lapply(df, function(col){
+  if (is.numeric(col)) {
+    col[is.infinite(col)] <- NA
+    col[is.na(col)] <- mean(col, na.rm = TRUE)
+  }
+  return(col)
+}))
+
+# Check class distribution
+table(df$Y)
+```
+
+The dataset consists of financial records for companies, with the binary outcome variable Y indicating bankruptcy (1) or not (0). The dataset is highly imbalanced, with only 353 bankruptcies compared to 125,007 non-bankruptcies. We address this imbalance in the modeling process using weighting techniques. In preparation for the different models we run, we fill missing values with the whole sample average, this improved our model performance.
+
+We split the data into training (70%) and testing (30%) sets. A 5-fold cross-validation is used to validate models, with plans to incorporate time-dependent cross-validation in future iterations.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE}
+
+# We exclude non-numerical columns and create our X dataframe, then matrix
+X <- df[, !names(df) %in% c("permno", "gvkey","linkdt","linkenddt", "conm", "fyear","fdate","fyr","datadate","dldte","dlrsn","DateFiled","NameCorp","Chapter","year_filed", "Y")]  # Variables explicatives (en supposant que df est votre dataframe)
+
+# defining X and y, we cannot pass the model a dataframe, it needs to be a matrix
+X <- as.matrix(X)
+y <- df$Y
+
+# checking NA's and inf
+any(is.na(X))
+any(is.infinite(X))
+any(is.na(y))
+any(is.infinite(y))
+
+# TRAIN AND TEST
+set.seed(123)  # Pour garantir la reproductibilité
+train_indices <- sample(1:nrow(df), size = 0.7 * nrow(df))  # 70% pour l'entraînement, to limit cross validations for the moment and computation time
+train_X <- X[train_indices, ]  # Variables explicatives d'entraînement
+train_y <- y[train_indices]  # Variable cible d'entraînement
+test_X <- X[-train_indices, ]  # Variables explicatives de test
+test_y <- y[-train_indices]  # Variable cible de test
+
+# models need factors
+train_y <- as.factor(train_y)
+test_y <- as.factor(test_y)
+table(train_y)  # Checking the distribution
+```
+
+# Baseline / Altman model
+
+As a baseline, we implement a logistic regression model inspired by Altman’s approach, which evaluates financial distress using key financial ratios. This model serves as a benchmark for more advanced techniques. Its performance is assessed using a Receiver Operating Characteristic (ROC) curve and other classification metrics.
+
+The dataset is split into training (70%) and testing (30%) sets, and a weighted logistic regression is applied to account for the class imbalance, as this improved model performance as explained below. The weights are calculated based on the proportions of positive (bankrupt) and negative (non-bankrupt) cases in the training data.
+
+```{r}
+#| code-fold: show
+
+# Splitting original dataframe 70:30 split
+train_index_df <- sample(1:nrow(df), size = 0.7 * nrow(df))
+train_df <- df[train_index_df, ]
+test_df <- df[-train_index_df, ]
+
+# Calculating weights
+total_count <- sum(table(train_df$Y))
+positive_count <- table(train_df$Y)[2]
+negative_count <- table(train_df$Y)[1]
+
+# Assigning weights
+train_df$weights <- ifelse(train_df$Y == 1, 
+                           total_count / (2 * positive_count), 
+                           total_count / (2 * negative_count))
+
+# Hazard model
+hazard_model <- glm(
+  Y ~ WCTA + RETA + EBTA + TLTA + SLTA,
+  data = train_df,
+  family = binomial(link = "logit"),
+  weights = weights
+)
+
+summary(hazard_model)
+
+# Getting predicted probabilities
+predicted_probs <- predict(hazard_model, newdata = test_df)
+
+# Calculating our ROC curve
+roc_curve <- roc(test_df$Y, predicted_probs)
+
+# Find the optimal cutoff for the given ROC curve (maximises sensitivity + specificity)
+optimal_cutoff <- coords(roc_curve, "best", ret = "threshold")
+# redefining our Y prediction to be 1 or 0 for confusion matrix
+predicted_class <- ifelse(predicted_probs >= optimal_cutoff[,1], 1, 0)
+
+#confusion matrix
+confusionMatrix(factor(predicted_class), test_y)
+
+# Plotting ROC curve and calculating AUC
+plot(roc_curve,
+     xlim = c(1,0),
+     ylim = c(0,1),
+     asp = 1,
+     main = "ROC Curve: Weighted Altman Model")
+auc(roc_curve)
+```
+
+We get an AUC of $0.716$. but the threshold for probability of default is $P(Y=1)=\frac{1}{1+ e^{-logit}} = 0.03613$, around $3.6\%$, due to the optimal cut off being $-5.6043$. This cut off value is still very low and could be due to our imbalanced data set and leads to a substantial number of false positives ($12542$), reducing the usability of our model.
+
+By introducing weights, our model has an AUC of $0.8922$, an optimal cut off of $0.4090422$ and therefore a probability of default threshold of $0.6008582$, around $60\%$. However, although reduced compared to the non-weighted regression, there remain significant amount of false positives ($3733$) and false negatives ($103$ out of $117$).
+
+# LASSO model
+
+We chose to implement a lasso regression due to its strengths in focusing the model on the most significant risk factors in our dataset of company balance sheets. Lasso regression achieves this by applying a penalty to the coefficients of less relevant variables, effectively shrinking them to zero. This reduces dimensionality by removing irrelevant or redundant variables, which not only simplifies the model but also helps to mitigate the risk of overfitting. As a result, lasso models are both efficient and highly interpretable—qualities that are particularly valuable when working with financial data where understanding the importance of specific risk factors is crucial.
+
+Lasso is also well-suited for datasets where variables are correlated, as is often the case with financial metrics. Instead of arbitrarily selecting one variable from a group of correlated predictors, lasso tends to select the variable that contributes most strongly to the model’s predictive power while penalising others. This ensures the model remains compact and focused on the most informative features.
+
+However, lasso does have limitations. One of its weaknesses is its inability to effectively capture non-linear relationships between variables and outcomes, which may be important in the context of complex financial systems. In such cases, more flexible models, such as random forests, may be better equipped to uncover these patterns. Nonetheless, for tasks involving variable selection, linear relationships, and interpretability, lasso provides a robust framework.
+
+In summary, lasso regression offers a balance of simplicity, interpretability, and dimensionality reduction, making it an excellent tool for identifying the most significant risk factors in our dataset. While it may not fully capture the complexity of non-linear relationships, its focus on relevant variables and avoidance of overfitting ensures it remains a valuable component of our analytical approach.
+
+Below we run the lasso regressions, using only relevant columns and not considering "dltrsn","dltdt", etc (non-numerical columns) used to generate $Y==1$.
+
+```{r}
+#| code-fold: show
+
+# We use cv.glmnet to train our lasso model
+cv_model <- cv.glmnet(train_X, train_y, alpha = 1, family = "binomial", nfolds=3)  # limiting to 3 folds, to ensure every run has at least 1 Y == 1
+
+best_lambda <- cv_model$lambda.min
+cat("Optimal Lambda: ", best_lambda, "\n")
+
+# we manually extract the best coefficients
+lasso_coefficients <- coef(cv_model, s = "lambda.min")
+print(lasso_coefficients)
+
+# Predictions on the test dataset as check
+predicted_probs <- predict(cv_model, newx = test_X, s = "lambda.min", type = "response")
+
+# Calculating our ROC curve
+roc_curve <- roc(test_y, predicted_probs)
+
+# Find the optimal cutoff for the given ROC curve (maximises sensitivity + specificity)
+optimal_cutoff <- coords(roc_curve, "best", ret = "threshold")
+# redefining our Y prediction to be 1 or 0 for confusion matrix
+predicted_class <- ifelse(predicted_probs[,1] >= optimal_cutoff[,1], 1, 0)
+
+#confusion matrix
+confusionMatrix(factor(predicted_class), test_y)
+
+# Plotting ROC curve and calculating AUC
+plot(roc_curve,
+     xlim = c(1,0),
+     ylim = c(0,1),
+     asp = 1,
+     main = "ROC Curve: Lasso Model")
+auc(roc_curve)
+```
+
+Our penalisation parameter is quite small, indicating that all variables are relevant. We compute an AUC of $0.8133$. The confusion matrix indicates that we we a substantial amount of false positives, and a significant amount of false negatives, $40 / 77$.
+
+Sensitivity, specificity, and balanced accuracy are key metrics for evaluating classification models. Sensitivity measures the model’s ability to correctly identify positive cases (true positive rate), such as defaults, while specificity assesses its ability to correctly identify negative cases (true negative rate), such as non-defaults. Balanced accuracy provides an average of sensitivity and specificity, offering a clearer picture of performance, particularly for imbalanced datasets. These metrics are crucial to ensure the model can reliably detect both rare events and common outcomes.
+
+## Lasso with weights
+
+Without weighting, the penalisation parameter in lasso favours a model where all coefficients are set to zero, leaving only the intercept. In such cases, the model essentially predicts the same average probability of bankruptcy for all observations, failing to capture the underlying relationships between predictors and the outcome. This occurs because the dataset contains far fewer observations where $Y==1$ (bankruptcy) compared to $Y==0$, causing the model to under represent the minority class.
+
+By introducing weights into the lasso model, we accounted for this imbalance, assigning greater importance to observations where $Y == 1$. This adjustment ensures that the model focuses more on correctly identifying instances of bankruptcy, rather than being dominated by the majority class. Weighted lasso helps to balance the contribution of both classes, improving the model’s ability to discriminate between companies at higher and lower risk of bankruptcy.
+
+Moreover, the weighted approach allows us to retain the interpretability and dimensionality-reducing properties of lasso, while also ensuring that the penalisation does not disproportionately disadvantage the minority class. This method enables the model to identify meaningful predictors of bankruptcy, even when faced with a highly skewed distribution of outcomes.
+
+Overall, implementing a weighted lasso model improved its performance on our unbalanced dataset by addressing the limitations of equal weighting. This step ensured that the model better aligned with the practical requirements of identifying financial distress, where correctly classifying minority cases is often of paramount importance.
+
+```{r}
+#| code-fold: show
+
+class_weights <- ifelse(train_y == 1, 
+                        1 / sum(train_y == 1), 
+                        1 / sum(train_y == 0))
+
+weighted_cv_model <- cv.glmnet(train_X, train_y, alpha = 1, family = "binomial", nfolds=3, weights = class_weights)  # limiting to 3 folds, to ensure timely computaion
+
+best_lambda <- weighted_cv_model$lambda.min
+cat("Optimal Lambda: ", best_lambda, "\n")
+
+# we manually extract the best coefficients
+lasso_coefficients <- coef(weighted_cv_model, s = "lambda.min")
+print(lasso_coefficients)
+
+# Predictions on the test dataset as check
+predicted_probs <- predict(weighted_cv_model, newx = test_X, s = "lambda.min", type = "response")
+```
+
+We generate the ROCR curve and accuracy measures using the pROC library.
+
+```{r, warning=FALSE}
+#| code-fold: show
+
+# Calculating our ROC curve
+roc_curve <- roc(test_y, predicted_probs)
+
+# Find the optimal cutoff for the given ROC curve (maximises sensitivity + specificity)
+optimal_cutoff <- coords(roc_curve, "best", ret = "threshold")
+# redefining our Y prediction to be 1 or 0 for confusion matrix
+predicted_class <- ifelse(predicted_probs[,1] >= optimal_cutoff[,1], 1, 0)
+
+#confusion matrix
+confusionMatrix(factor(predicted_class), test_y)
+
+# Plotting ROC curve and calculating AUC
+plot(roc_curve,
+     xlim = c(1,0),
+     ylim = c(0,1),
+     asp = 1,
+     main = "ROC Curve: Weighted Lasso Model")
+auc(roc_curve)
+```
+
+Weighting substantially improves our model performance as we give more importance the the observations of interest, namely when bankruptcy occurs. the AUC value rises to $0.9041$. the false negative rate drops substantially to $25/92$.
+
+# Random forest
+
+We decided to explore Random forest models to complement the lasso models due to their strengths in capturing non-linear relationships and handling multicollinearity. This robustness allows them to uncover complex patterns in financial data, making them particularly suitable for our dataset of company balance sheets.
+
+In our data set, many financial metrics are correlated, and while lasso penalises and often excludes such variables, random forests are still able to leverage the information they provide. This makes them especially valuable for datasets where variables contribute meaningfully despite their interdependence. Furthermore, random forests are inherently robust against overfitting due to their use of bootstrapping and random feature selection when constructing each tree, ensuring the model generalises well to unseen data.
+
+However, the trade-off with random forests is reduced interpretability. Unlike lasso, which directly quantifies the contribution of each variable to the prediction, random forests function more as a "black box," making it harder to understand the specific relationships driving the model. Despite this limitation, their ability to uncover non-linear patterns and handle correlated variables makes them an excellent choice for our dataset, complementing the strengths of more interpretable models like lasso. By combining random forests with other techniques, we can balance predictive power with insights into the underlying financial relationships.
+
+We first implement a basic random forest model to evaluate its baseline performance.
+
+```{r, warning=FALSE}
+#| echo: false
+
+# Ajuster le modèle Random Forest
+rf_model <- randomForest(x = train_X, y = train_y, 
+                         ntree = 500,  # Nombre d'arbres dans la forêt
+                         mtry = sqrt(ncol(train_X)),  # Number of variables to test
+                         importance = TRUE)  # Calculer l'importance des variables
+
+# Résumé du modèle
+print(rf_model)  # Affiche un résumé du modèle Random Forest
+
+# Error rate by number of trees
+plot(rf_model, main = "Error Rate vs. Number of Trees")
+
+# Variable importance
+print(importance(rf_model))
+varImpPlot(rf_model, main = "Variable Importance Plot")
+
+# We also plot the standard ROCR curve using the adjusted probabilities, instead of factor prediction, probability
+predicted_probs_tree <- predict(rf_model, newdata = test_X, type = "prob")
+
+# Calculating our ROC curve
+roc_curve <- roc(test_y, predicted_probs_tree[,2])
+
+optimal_cutoff <- coords(roc_curve, "best", ret = "threshold")
+# redefining our Y prediction to be 1 or 0 for confusion matrix
+predicted_class <- ifelse(predicted_probs_tree[,2] >= optimal_cutoff[,1], 1, 0)
+
+confusionMatrix(factor(predicted_class), test_y)
+
+# Plotting ROC curve and calculating AUC
+plot(roc_curve,
+     xlim = c(1,0),
+     ylim = c(0,1),
+     main = "ROC Curve: Random Forest Model")
+auc(roc_curve)
+```
+
+With the optimal threshold of $0.003$ ($0.3\%$, which is un-naturally low) we get an AUC of $0.9401$ with a low false negative rate of just $11/106$. However, due to this low probability of default threshold, we have large amount of false positive predictions $3941$.
+
+## Random Forest with integrated weights for unbalanced data
+
+```{r, warning=FALSE}
+#| code-fold: show
+
+# Adjusting class weights for randomforest model using # Inverse proportion
+class_weights <- table(train_y)
+class_weights <- 1 / class_weights  
+class_weights <- class_weights / sum(class_weights)
+
+# Adding class weights
+weighted_rf_model <- randomForest(x = train_X, y = train_y, 
+                         ntree = 500,
+                         mtry = sqrt(ncol(train_X)),
+                         classwt = class_weights,
+                         importance = TRUE)
+print(weighted_rf_model)
+plot(weighted_rf_model, main = "Error Rate vs. Number of Trees (Weighted)")
+
+# Variable importance
+print(importance(weighted_rf_model))
+varImpPlot(weighted_rf_model, main = "Variable Importance Plot (Weighted)")
+
+# getting predictions
+predicted_probs_weighted_tree <- predict(weighted_rf_model, newdata = test_X, type = "prob")
+
+# Calculating our ROC curve
+roc_curve <- roc(test_y, predicted_probs_weighted_tree[,2])
+
+optimal_cutoff <- coords(roc_curve, "best", ret = "threshold")
+# redefining our Y prediction to be 1 or 0 for confusion matrix
+predicted_class <- ifelse(predicted_probs_weighted_tree[,2] >= optimal_cutoff[,1], 1, 0)
+
+confusionMatrix(factor(predicted_class), test_y)
+
+# Plotting ROC curve and calculating AUC
+plot(roc_curve,
+     xlim = c(1,0),
+     ylim = c(0,1),
+     main = "ROC Curve: Weighted Random Forest Model")
+auc(roc_curve)
+```
+
+The weighted random forest model improves upon the un-weighted version by reducing false negatives and false positives, achieving a higher AUC. Despite being less interpretable than lasso, random forest excels at uncovering non-linear relationships, making it an essential component of our analytical approach.
+
+# Time Series Cross-Validation
+
+## Altman Model
+
+In our project, we recognized that classic K-fold cross-validation, which randomly splits data into k folds, doesn’t work for our data of company balance sheets because it ignores the time-dependent nature of the data. Each year’s financial performance is influenced by prior years, so randomly shuffling the data breaks the time order and risks "data leakage," where future information improperly influences predictions. Moreover, randomly splitting the data creates unrealistic scenarios where test data can occur earlier in time than the training data, which doesn’t reflect how predictions are made in practice.
+
+To address this, we used time-series cross-validation (TSCV), a method designed to respect the chronological order of data. By splitting the data sequentially, we ensured that training data only included earlier years and test data consisted of later years. For instance, starting with five years of data, we trained on Year 1 and tested on Year 2, then trained on Years 1–2 and tested on Year 3, and so on. This approach matches real-world financial modeling, where predictions are based on past data to forecast future outcomes, such as assessing bankruptcy risk.
+
+Time-series cross-validation is particularly suited to our data because it eliminates data leakage and respects the temporal autocorrelation in financial data, where trends evolve over time. It also evaluates the model's ability to generalise to future, unseen periods, which is crucial for accurate predictions. While this method does reduce the amount of training data in early folds and is computationally more intensive than classic K-fold cross-validation, it provides a much more realistic and reliable framework for modeling our time-dependent data.
+
+We first revisit the logistic regression model inspired by Altman’s approach, with weighted adjustments to address class imbalance.
+
+```{r}
+#| code-fold: show
+
+# We order our data set
+df_ordered <- df[order(df$fyear), ]
+
+all_predictions <- c()
+all_actuals <- c()
+
+# Time-series cross-validation for 5 folds, with adjusted fold_size
+k <- 5
+fold_size <- floor(nrow(df_ordered) / k)
+
+# Time-series cross-validation loop
+for (i in 1:k) {
+  # Définir les indices pour le training et le test
+  train_indices <- 1:(i * fold_size - fold_size)
+  test_indices <- (i * fold_size - fold_size + 1):(i * fold_size)
+ 
+  train_data <- df_ordered[train_indices, ]
+  test_data <- df_ordered[test_indices, ]
+  
+  # Calculate weights for imbalanced classes
+  total_count <- sum(table(train_data$Y))
+  positive_count <- table(train_data$Y)[2]
+  negative_count <- table(train_data$Y)[1]
+  train_data$weights <- ifelse(train_data$Y == 1, 
+                           total_count / (2 * positive_count), 
+                           total_count / (2 * negative_count))
+  
+  # Train hazard model
+  hazard_model <- glm(
+    Y ~ WCTA + RETA + EBTA + TLTA + SLTA,
+    data = train_data,
+    family = binomial(link = "logit"),
+    weights = weights
+  )
+  
+  # Get prediction on test data
+  predictions <- predict(hazard_model, newdata = test_data)
+  
+  # results stored and actual values
+  all_predictions <- c(all_predictions, predictions)
+  all_actuals <- c(all_actuals, test_data$Y)
+  
+  # Fold tracker
+  cat("Training Years:", range(train_data$fyear), " | Test Year:", unique(test_data$fyear), "\n")
+}
+
+# Calculating our ROC curve
+roc_curve <- roc(all_actuals, all_predictions)
+
+# Determine the optimal cut-off
+optimal_cutoff <- coords(roc_curve, "best", ret = "threshold")
+# Redefining our Y prediction to be 1 or 0 for confusion matrix
+predicted_class <- ifelse(all_predictions >= optimal_cutoff[,1], 1, 0)
+
+# Confusion matrix
+confusionMatrix(as.factor(as.vector(predicted_class)), as.factor(all_actuals))
+
+# Plotting ROC curve and calculating AUC
+plot(roc_curve,
+     xlim = c(1,0),
+     ylim = c(0,1),
+     asp = 1,
+     main = "ROC Curve: TSCV - Weighted Altman Model")
+auc(roc_curve)
+
+# Optimal cut-off and corresponding probability threshold
+cat("Optimal cut off:", optimal_cutoff[,1], " | Probability Threshold:", (1)/(1+exp(-(optimal_cutoff[,1]))))
+```
+
+Using a k-fold time-dependent cross-validation approach with the introduction of weights, our model achieved an AUC of $0.6125$, which is slightly lower than the $0.6125$observed previously without cross-validation. The optimal cut-off for classification was determined to be $0.4877$, corresponding to a probability of default threshold of approximately $62\%$, which is marginally higher than before.
+
+The confusion matrix reveals a considerable number of false positives ($9438$) and false negatives ($192$ out of $161$ actual positives). These results are not unexpected, as models evaluated without time series cross-validation often reuse some of the same data seen during training, resulting in overly optimistic performance metrics, such as an inflated AUC.
+
+In contrast, time series cross-validation ensures that the training and testing data are separated chronologically, thereby testing the model's ability to generalise to unseen future periods. This methodology provides a more realistic assessment of model performance, which often results in a lower AUC compared to evaluations without temporal separation. Such results underscore the challenges of accurately predicting defaults in a dynamic, time-sensitive context and highlight the importance of robust validation techniques in model evaluation.
+
+## Transformed Altman Model
+
+Building on Altman’s framework, we enhance model performance and interpretability by transforming key financial variables. To address the imbalanced dataset, we apply weighted observations, ensuring that the minority class (bankruptcy cases) receives appropriate emphasis. The transformed model is evaluated using standard training and testing splits, incorporating these adjustments to improve predictive accuracy.
+
+The transformations applied to the dataset include several modifications aimed at better capturing the relationships between financial metrics and default risk. The ratio of market equity to book liabilities (ME/BL) is transformed to (\$\text{ME\_BL\_transformed} = 1 + \log(\text{ME\_BL}) \$), which helps to mitigate skewness and provide a more normalized distribution. Similarly, the retained earnings to total assets ratio (RETA) undergoes a logarithmic transformation, defined as $\text{RETA}_{transformed} = -\ln(1 - \text{RETA})$ for values of RETA less than 1, to adjust for diminishing marginal effects. The earnings before taxes to total assets ratio (EBTA) is transformed in the same manner as RETA, using \$ \text{EBTA}\_{transformed} = -\ln(1 - \text{EBTA})\$ for values of EBTA less than 1, capturing the non-linear effects of earnings on financial health.
+
+In addition to these transformations, the logarithm of liabilities is used to create a variable called Size \$ \text{Size} = \log(\text{lt}) \$, offering a scale-invariant measure of firm size. Lastly, the age of a firm is calculated as \$ \text{Age} = \text{fyear} - \text{linkdt}\_{year} \$, representing the number of years since the firm’s data first appeared. These transformations collectively aim to improve the model's ability to generalise and provide more meaningful insights into the financial predictors of bankruptcy.
+
+```{r}
+
+# We create a new database specifically for the altman model
+df_Altman <- df %>%
+  mutate(
+    # Ratio ME/BL : Market Value of Equity / Book Liabilities
+    ME_BL = avg_market_cap / lt,
+    ME_BL_transformed = 1 + log(ME_BL),
+    # Transformation de RETA : -ln(1 - RETA)
+    RETA_transformed = ifelse(RETA < 1, -log(1 - RETA), NA),
+    # Transformation de EBTA : -ln(1 - EBTA)
+    EBTA_transformed = ifelse(EBTA < 1, -log(1 - EBTA), NA),
+    # Size : 
+    Size = log(lt),
+    # Âge (Age) 
+    Age = fyear - as.numeric(format(as.Date(linkdt), "%Y"))
+  )
+
+# we replace infty's with NAs and replace them with the sample mean as done before, only 977 entries had NA's, out of 626800
+df_Altman <- data.frame(lapply(df_Altman, function(col){
+  if (is.numeric(col)) {
+    col[is.infinite(col)] <- NA
+    col[is.na(col)] <- mean(col, na.rm = TRUE)
+  }
+  return(col)
+}))
+
+# df Version for Time Dependent Cross Validation later, Selecting only required columns
+df_Altman_ordered <- na.omit(df_Altman |> select(ME_BL_transformed, RETA_transformed, EBTA_transformed, Size, Age, fyear, Y))
+# Repeated
+df_Altman <- na.omit(df_Altman |> select(ME_BL_transformed, RETA_transformed, EBTA_transformed, Size, Age, Y))
+
+# Splitting into training and testing sets
+train_index_df <- sample(1:nrow(df_Altman), size = 0.7 * nrow(df_Altman))
+train_df <- df_Altman[train_index_df, ]
+test_df <- df_Altman[-train_index_df, ]
+
+# Assigning weights
+total_count <- sum(table(train_df$Y))
+positive_count <- table(train_df$Y)[2]
+negative_count <- table(train_df$Y)[1]
+train_df$weights <- ifelse(train_df$Y == 1, 
+                           total_count / (2 * positive_count), 
+                           total_count / (2 * negative_count))
+
+# Régression logistique avec les nouvelles variables transformées
+transformed_Altman_model <- glm(
+  Y ~ RETA_transformed + EBTA_transformed + ME_BL_transformed + Size + Age,
+  data = train_df,
+  family = binomial(link = "logit"),
+   weights = weights
+)
+
+# Résumé du modèle
+summary(transformed_Altman_model)
+
+# Prédictions de probabilité
+predicted_prob_transformed <- predict(transformed_Altman_model, newdata = test_df)
+
+# Calculating our ROC curve
+roc_curve <- roc(test_df$Y, predicted_prob_transformed)
+
+# Find the optimal cutoff for the given ROC curve (maximises sensitivity + specificity)
+optimal_cutoff <- coords(roc_curve, "best", ret = "threshold")
+# redefining our Y prediction to be 1 or 0 for confusion matrix
+predicted_class <- ifelse(predicted_prob_transformed >= optimal_cutoff[,1], 1, 0)
+
+#confusion matrix
+confusionMatrix(factor(as.vector(predicted_class)), factor(test_df$Y))
+
+# Plotting ROC curve and calculating AUC
+plot(roc_curve,
+     xlim = c(1,0),
+     ylim = c(0,1),
+     asp = 1,
+     main = "ROC Curve: Weighted Transformed Altman Model")
+auc(roc_curve)
+
+# Optimal probability threshold
+cat("Optimal cut off:", optimal_cutoff[,1], " | Probability Threshold:", (1)/(1+exp(-(optimal_cutoff[,1]))))
+```
+
+The transformed Altman model demonstrates improved performance, achieving an AUC of $0.8581$, which is a notable enhancement compared to the baseline model. The optimal cut-off point was calculated as $-0.1905$, corresponding to a probability threshold of approximately $45.3\%$ for classifying defaults. The model's evaluation revealed $9,806$ false positives and $12$ false negatives out of $100$ actual positives. While the model is highly effective at identifying the non-defaulting firms, it struggles to predict defaults accurately. Sensitivity, which measures the model's ability to correctly identify actual positives, stood at $73.8\%$, while specificity, which evaluates the correct identification of negatives, reached $89.3\%$. The balanced accuracy, which combines sensitivity and specificity, was calculated as $81.6\%$, indicating a reasonable balance in the model’s performance.
+
+The signs of the coefficients are consistent our expectations, however, the coefficient **Size** and **Age** are not significant, which can be due to a lack of variability in the data. The negative coefficients for **RETA_transformed**, **EBTA_transformed**, and **ME_BL_transformed** indicate that firms with higher retained earnings to total assets, earnings before taxes to total assets, or market equity to book liabilities ratios are less likely to default. Additionally, larger firm size was associated with a slightly increased likelihood of default (**positive Size coefficient**), while older firms showed reduced default risk (**negative Age coefficient**).
+
+However, it is essential to note that this evaluation method may overestimate the model’s performance metrics, such as AUC, as some temporal dependencies in the data could lead to leakage between training and testing sets. Unlike time series cross-validation, which we implement below, this approach does not account for the chronological order of the data.
+
+## Time-Dependent Cross-Validation on Transformed Altman Model
+
+```{r}
+
+# We order our altman specific dataframe
+df_Altman_ordered <- df_Altman_ordered[order(df_Altman_ordered$fyear), ]
+
+# As before, we clear the holding variables
+all_predictions <- c()
+all_actuals <- c()
+
+# Time-series cross-validation for 5 folds, with adjusted fold_size
+k <- 5
+fold_size <- floor(nrow(df_Altman_ordered) / k)
+# Loop
+for (i in 1:k) {
+  # Définir les indices pour le training et le test
+  train_indices <- 1:(i * fold_size - fold_size)
+  test_indices <- (i * fold_size - fold_size + 1):(i * fold_size)
+ 
+  train_df <- df_Altman_ordered[train_indices, ]
+  test_df <- df_Altman_ordered[test_indices, ]
+  
+  # Adding weights for better model performance
+  total_count <- sum(table(train_df$Y))
+  positive_count <- table(train_df$Y)[2]
+  negative_count <- table(train_df$Y)[1]
+
+  # Assigning weights
+  train_df$weights <- ifelse(train_df$Y == 1, 
+                           total_count / (2 * positive_count), 
+                           total_count / (2 * negative_count))
+  
+  transformed_Altman_model <- glm(
+  Y ~ RETA_transformed + EBTA_transformed + ME_BL_transformed + Size +   Age,
+  data = train_df,
+  family = binomial(link = "logit"),
+  weights = weights
+  )
+
+# Prediction on test data
+  predictions <- predict(transformed_Altman_model, newdata = test_df)
+  
+  # results stored
+  all_predictions <- c(all_predictions, predictions)
+  all_actuals <- c(all_actuals, test_data$Y)
+  
+  # split tracker
+  cat("Training Years:", range(train_data$fyear), " | Test Year:",      unique(test_data$fyear), "\n")
+}
+
+# Calculating our ROC curve
+roc_curve <- roc(all_actuals, all_predictions)
+
+# Optimal cutoff
+optimal_cutoff <- coords(roc_curve, "best", ret = "threshold")
+# Redefining our Y prediction to be 1 or 0 for confusion matrix
+predicted_class <- ifelse(all_predictions >= optimal_cutoff[,1], 1, 0)
+
+# Confusion matrix
+confusionMatrix(as.factor(as.vector(predicted_class)), as.factor(all_actuals))
+
+# Plotting ROC curve and calculating AUC
+plot(roc_curve,
+     xlim = c(1,0),
+     ylim = c(0,1),
+     asp = 1,
+     main = "ROC Curve: TSCV - Weighted Transformed Altman Model")
+auc(roc_curve)
+
+cat("Optimal cut off:", optimal_cutoff[,1], " | Equivalent probability threshold:", (1)/(1+exp(-(optimal_cutoff[,1]))))
+```
+
+Using a time-dependent cross-validation approach, our transformed Altman model achieved an AUC of $0.5363$, significantly lower than the results from standard train-test splits. The optimal cut-off point was $0.0781$, corresponding to a probability threshold of $51.95\%$ for classifying defaults.
+
+The confusion matrix highlights a substantial number of false positives ($24,876$) and a small number of false negatives ($148$ **out of** $62$ **actual positives**). While sensitivity remains high ($80.1\%$), specificity is notably low ($29.5\%$), with a balanced accuracy of $54.8\%$, reflecting the model's difficulty in accurately distinguishing between defaulting and non-defaulting firms in this setting.
+
+The warnings regarding non-integer successes in the binomial GLM suggest potential issues with the data or model fit, warranting further investigation. Nonetheless, the time-dependent cross-validation provides a more realistic evaluation by testing the model's ability to generalise to future periods, which often results in lower metrics compared to static train-test splits. These results underline the importance of robust validation methods in assessing predictive performance in a dynamic financial context.
+
+# Distance-to-default
+
+The Distance to Default (DtD) is a measure derived from the Merton model that quantifies the financial health of a firm by estimating how far its asset value is from the point of insolvency. It represents the "buffer" or cushion between the current value of a firm’s assets and its debt obligations, scaled by the uncertainty or volatility of those assets. A higher DtD implies that the firm’s assets are comfortably above its liabilities, signaling lower risk of default. Conversely, a lower DtD indicates that the firm is closer to insolvency, reflecting a higher probability of default. Bharah and Shumway suggests that simple DtD models that rely on assumptions can perform comparably to the more rigorous DtD that require more computations to extract accurate estimates. We check this idea with the following chunks. We firstly run a naive DtD and we then develop an algorithm more loyal to the Merton model.
+
+In this code, we calculate average return which is a key parameter in the calculation of the DtD. Even though the derivation is usually carried out using stock price, we use use the average market capitalisation as a proxy for it.
+
+```{r}
+# We calculate average return
+df_DtD <- df %>%
+  arrange(gvkey, fyear) %>%  
+  group_by(gvkey) %>% 
+  mutate(
+    r_prev = (avg_market_cap - lag(avg_market_cap)) / lag(avg_market_cap)  
+  ) %>%
+  ungroup()
+
+head(df_DtD, 10)
+```
+
+Here, we consider two different DtD derivations. The naive one relying on linear combination of equity volatility and debt volatility to estimate assets volatility.It is called naive because a linear relationship is assumed for assets value and assets volatility instead of a proper estimation. We also implement another DtD calculation following the same approach but using directly equity volatility as an estimation for assets volatility to see if that changes significantly the results.
+
+```{r}
+
+# attach(df_DtD)
+
+# we need the Variables: E (Market Value of Equity), sigma_E (Equity Volatility), F (Face Value of Debt), r_prev (Previous year's return)
+df_DtD <- df_DtD %>%
+  mutate(
+    # Step 2: Approximate debt volatility using a linear combination as in the article 
+    sigma_D = 0.05 + 0.25 * rolling_volatility,  # Debt volatility 
+
+    # Step 3: Calculate total firm volatility
+    sigma_V = (avg_market_cap / (avg_market_cap + lt)) * rolling_volatility + (lt / (avg_market_cap + lt)) * sigma_D,  # Total volatility
+
+    # Step 4: Set expected return
+    mu = r_prev,  # Expected return based on past equity returns
+
+    # Step 5: Calculate Naive DtD
+    DtD_naive = (log((avg_market_cap + lt) / lt) + (r_prev - 0.5 * sigma_V^2) * 1) / (sigma_V * sqrt(1))
+  )
+
+# Step 6: Iterative Merton DtD (using simplified assumptions)
+df_DtD <- df_DtD %>%
+  mutate(
+    DtD_modeled = (log((avg_market_cap + lt) / lt) + (r_prev - 0.5 * rolling_volatility^2) * 1) / (rolling_volatility * sqrt(1))  # Using equity volatility directly
+  )
+
+# Calculate probabilities of default
+df_DtD <- df_DtD %>%
+  mutate(
+    P_default_naive = pnorm(-DtD_naive),
+    P_default_modeled = pnorm(-DtD_modeled)
+  )
+  
+# Compare the two predictors
+comparison <- df_DtD %>%
+  select(conm, fyear, DtD_naive, DtD_modeled, P_default_naive, P_default_modeled)
+
+comparison_cleaned <- na.omit(comparison) 
+
+# Output the comparison
+head(comparison_cleaned)
+
+#cleaning data 
+comparison_cleaned <- comparison %>%
+  filter(!is.na(DtD_naive), !is.na(DtD_modeled))
+
+# difference between the two DtDs
+comparison_cleaned <- comparison_cleaned %>%
+  mutate(DtD_difference = DtD_modeled - DtD_naive)
+```
+
+The two models seems to display similar results globally. Hence, using equity volatility as estimate for asset volatility doesn't seem to change drastically the results.
+
+## Iterative DtD approach closer related to the Merton model
+
+The iterative DtD is more rigorous and more loyal to the Merton model as it aims at estimating more accurate values for assets value and asset volatility using iterative computations based on both the equity equation and the equity volatility. The method is carried out until converging values for assets and asset volatility are found. In their articles, Shumway and Bharath claims that simpler DtD methods such as the one derived previously should lead to similar results as the iterative one. In this code, we use the equation : $E = V * N(d1) - F * e(-r * T) * N(d2)$
+
+as in the Merton model. The iterative method is essential for solving the Merton model equation because the relationship between the market value of equity and the total value of assets is non-linear and implicitly involves multiple unknowns, such as the asset volatility and the total asset value. Unlike naive approximations, which often assume a fixed relationship between equity volatility and asset volatility, the iterative approach ensures consistency with the observed market data, including the equity value and its volatility.
+
+The purpose of the following lines is to calculate the total value of assets as well as assets volatility, and then, using those accurate values, derive the DtD and the probability of default. To do so, we firstly define a function that will estimate the volatility of assets and their value. The we define three other function to calculate the d1 term in the equation, the DtD, and the probability of default. Finally, we use an algorithm that will display the DtD and the probability of default for any chosen firm given a certain year. The algorithm firstly collects three information needed for the function to work : the average market capitalisation (used as proxy for equity),the rolling volatility (used as a proxy for equity volatility) and long term debt.
+
+Note that we choose r = 1 year treasury yields, using the data provided, as risk free rate as it is the one for short maturity US treasury bonds.
+
+```{r}
+#function for normal cumulative distribution that will display the probability of xbeinbeing inferior to x
+
+
+##############   SET UP ###############""
+
+N <- function(x) {
+  pnorm(x)                   
+}
+
+# estimation function for total value of asset and asset volatiliTY; 
+estimate_V_sigmaV <- function(avg_market_cap, rolling_volatility, lt, r, T = 1, tol = 1e-6, max_iter = 100) {
+  # Initialisation
+  V <- avg_market_cap + lt
+  sigma_V <- rolling_volatility * avg_market_cap / (avg_market_cap + lt)
+  
+  # Iteration
+  for (i in 1:max_iter) {
+    
+    d1 <- calc_d1(V, lt, r, sigma_V, T)
+    d2 <- d1 - sigma_V * sqrt(T)
+    
+    #updating values
+    V_new <- avg_market_cap + lt * exp(-r * T) * N(d2) / N(d1)
+    sigma_V_new <- (rolling_volatility * avg_market_cap) / (V_new * N(d1))
+    
+    # convergence checking
+    if (abs(V_new - V) < tol && abs(sigma_V_new - sigma_V) < tol) {
+      break
+    }
+    
+    # update and next iteration
+    V <- V_new
+    sigma_V <- sigma_V_new
+  }
+  
+  # return results
+  list(V = V, sigma_V = sigma_V, iterations = i)
+}
+
+
+calc_d1 <- function(V, lt, r, sigma_V, T) {
+  (log(V / lt) + (r + 0.5 * sigma_V^2) * T) / (sigma_V * sqrt(T))
+}
+
+# DtD function
+calc_DtD <- function(V, lt, r, sigma_V, T) {
+  (log(V / lt) + (r - 0.5 * sigma_V^2) * T) / (sigma_V * sqrt(T))
+}
+
+# Pd function
+calc_default_probability <- function(DtD) {
+  pnorm(-DtD)
+}
+
+########### ALGORITHM to display the PD and   DtD of a given firm 
+
+
+#this function is created to display the 3 info needed to implement the iteration 
+
+get_company_values <- function(df, company_name, year) {
+  
+  company_data <- df[df$conm == company_name & df$fyear == year, ]
+  
+  
+  if (nrow(company_data) == 0) {
+    cat("No data found for '", company_name, "' in ", year, ".\n", sep = "")
+    return(NULL)  
+  }
+  
+  # Extract values
+  lt_value <- company_data$lt
+  rolling_volatility_value <- company_data$rolling_volatility
+  avg_market_cap_value <- company_data$avg_market_cap
+  treasury_1Y_Value <- company_data$treasury_1Y
+  
+  # Affichage des résultats
+  cat("Results for '", company_name, "' in ", year, ":\n", sep = "")
+  cat("---------------------------------------------------------\n")
+  cat("lt                     :", lt_value, "\n")
+  cat("rolling_volatility     :", rolling_volatility_value, "\n")
+  cat("avg_market_cap         :", avg_market_cap_value, "\n")
+  cat("---------------------------------------------------------\n")
+  cat("1 year teasury yield         :", treasury_1Y_Value, "\n")
+  cat("---------------------------------------------------------\n")
+  
+  # Retourner les résultats sous forme de liste pour une utilisation ultérieure
+  return(list(
+    lt = lt_value,
+    rolling_volatility = rolling_volatility_value,
+    avg_market_cap = avg_market_cap_value,
+    r = treasury_1Y_Value
+  ))
+}
+
+
+#choose the name of the compagny and the year : 
+
+step1results <- get_company_values(df, "AAR CORP", 2006)
+
+#take the results 
+
+# Use the precedent results as inputs for the function that will estimate the two parameters 
+result <- estimate_V_sigmaV(avg_market_cap = step1results$avg_market_cap   , 
+                            rolling_volatility =  step1results$rolling_volatility   , lt = step1results$lt   , r = step1results$r, T=1)
+
+
+V_est <- result$V
+sigma_V_est <- result$sigma_V
+
+# (DtD)
+DtD <- calc_DtD(V = V_est, lt = step1results$lt, r = step1results$r, sigma_V = sigma_V_est, T = T)
+cat("Distance to Default (DtD) :", DtD, "\n")
+
+# probability of default
+P_default <- calc_default_probability(DtD)
+cat("probability of default :", P_default, "\n")
+```
+
+For AAR CORP in 2006, the result obtained for the PD and the DtD is significantly smaller to that of the previous DtD estimation, $5.7\%$ compared to around $37\%$. Repeating this for all companies we find
+
+## ROC Curves For DtD Models
+
+We create our ROC curve and AUC measures for the DtD models, the DtD_modelled and the iterative DtD. We first analyse the Direct equity DtD measure instead of the Naive one, the we will compare this to the iterative DtD.
+
+```{r}
+
+# We remove NAs
+df_DtD_cleaned <- na.omit(df_DtD |> select(Y, P_default_naive, P_default_modeled))
+
+# Calculating our ROC curve
+roc_curve <- roc(df_DtD_cleaned$Y, df_DtD_cleaned$P_default_modeled)
+
+# Optimal cutoff
+optimal_cutoff <- coords(roc_curve, "best", ret = "threshold")
+# Redefining our Y prediction to be 1 or 0 for confusion matrix
+predicted_class <- ifelse(df_DtD_cleaned$P_default_modeled >= optimal_cutoff[,1], 1, 0)
+
+# Confusion matrix
+confusionMatrix(as.factor(as.vector(predicted_class)), as.factor(df_DtD_cleaned$Y))
+
+# Plotting ROC curve and calculating AUC
+plot(roc_curve,
+     xlim = c(1,0),
+     ylim = c(0,1),
+     asp = 1,
+     main = "ROC Curve: DtD Model")
+auc(roc_curve)
+
+cat("Optimal cut off:", optimal_cutoff[,1])
+```
+
+The results from the Distance-to-Default model, estimated using the Schumway (2001) approach, demonstrate an AUC of $0.5032$, which is markedly lower than both the transformed Altman model under time-dependent cross-validation ($0.5363$) and the standard train-test split $0.8595$. The optimal cut-off was calculated as $0.3863$, but the confusion matrix reveals substantial classification issues, with a high number of false positives ($48,119$) and limited true positives ($102$). Sensitivity ($56.7%$) and specificity ($34.3\%$) remain notably weak, and the balanced accuracy is just $45.5\%$, the lowest among all the models evaluated.
+
+We now analyse the iterative DtD predicted probabilities and repeat the calculation we did above, only for the whole dataset now. The code in loop form was generated with the help of ChatGPT but was computationally too difficult for my computer so I asked ChatGPT to vectorise it. This code was substantially faster.
+
+```{r, echo=FALSE}
+#| code-fold: true
+
+# # we test the loop with a 10% sample:
+# train_index_df <- sample(1:nrow(df_DtD), size = 0.1 * nrow(df_DtD))
+# train_df <- df_DtD[train_index_df, ]
+# 
+# # Function to calculate the default probability for each company in a dataset
+# calc_all_probabilities <- function(df) {
+#   # Create an empty results data frame
+#   results <- data.frame(
+#     conm = character(),
+#     fyear = integer(),
+#     DtD = numeric(),
+#     P_default = numeric(),
+#     iterations = integer(),
+#     stringsAsFactors = FALSE
+#   )
+#   
+#   # Loop through unique company-year combinations
+#   unique_companies <- unique(df$conm)
+#   
+#   for (company_name in unique_companies) {
+#     company_data <- df[df$conm == company_name, ]
+#     unique_years <- unique(company_data$fyear)
+#     
+#     for (year in unique_years) {
+#       # Extract company values for the year
+#       step1results <- get_company_values(df, company_name, year)
+#       
+#       if (!is.null(step1results)) {
+#         # Estimate V and sigma_V
+#         result <- estimate_V_sigmaV(
+#           avg_market_cap = step1results$avg_market_cap,
+#           rolling_volatility = step1results$rolling_volatility,
+#           lt = step1results$lt,
+#           r = step1results$r,
+#           T = 1
+#         )
+#         
+#         V_est <- result$V
+#         sigma_V_est <- result$sigma_V
+#         
+#         # Calculate DtD
+#         DtD <- calc_DtD(
+#           V = V_est,
+#           lt = step1results$lt,
+#           r = step1results$r,
+#           sigma_V = sigma_V_est,
+#           T = 1
+#         )
+#         
+#         # Calculate default probability
+#         P_default <- calc_default_probability(DtD)
+#         
+#         # Add results to the results data frame
+#         results <- rbind(
+#           results,
+#           data.frame(
+#             conm = company_name,
+#             fyear = year,
+#             DtD = DtD,
+#             P_default = P_default,
+#             iterations = result$iterations
+#           )
+#         )
+#       }
+#     }
+#   }
+#   
+#   # Return the full results
+#   return(results)
+# }
+# 
+# # Apply the function to your dataset
+# all_results <- calc_all_probabilities(train_df)
+# 
+# # Preview the results
+# head(all_results)
+```
+
+```{r}
+#| code-fold: false
+
+# Vectorized version of the calculations
+calc_all_probabilities_vectorized <- function(df) {
+  # Preallocate vectors to store results
+  n <- nrow(df)
+  DtD_vec <- numeric(n)
+  P_default_vec <- numeric(n)
+  iterations_vec <- integer(n)
+  
+  # Initial estimates for V and sigma_V
+  V_est_vec <- df$avg_market_cap + df$lt
+  sigma_V_est_vec <- df$rolling_volatility * df$avg_market_cap / (df$avg_market_cap + df$lt)
+  
+  # Constants
+  T <- 1
+  tol <- 1e-6
+  max_iter <- 100
+  
+  # Iterative estimation for V and sigma_V
+  for (iter in 1:max_iter) {
+    # Calculate d1 and d2
+    d1_vec <- (log(V_est_vec / df$lt) + (df$treasury_1Y + 0.5 * sigma_V_est_vec^2) * T) / 
+              (sigma_V_est_vec * sqrt(T))
+    d2_vec <- d1_vec - sigma_V_est_vec * sqrt(T)
+    
+    # Update V and sigma_V
+    V_new_vec <- df$avg_market_cap + df$lt * exp(-df$treasury_1Y * T) * N(d2_vec) / N(d1_vec)
+    sigma_V_new_vec <- (df$rolling_volatility * df$avg_market_cap) / (V_new_vec * N(d1_vec))
+    
+    # Check for convergence
+    converged <- (abs(V_new_vec - V_est_vec) < tol & abs(sigma_V_new_vec - sigma_V_est_vec) < tol)
+    if (all(converged)) {
+      iterations_vec <- iter
+      break
+    }
+    
+    # Update for the next iteration
+    V_est_vec <- V_new_vec
+    sigma_V_est_vec <- sigma_V_new_vec
+  }
+  
+  # Calculate DtD
+  DtD_vec <- (log(V_est_vec / df$lt) + (df$treasury_1Y - 0.5 * sigma_V_est_vec^2) * T) / 
+             (sigma_V_est_vec * sqrt(T))
+  
+  # Calculate default probability
+  P_default_vec <- N(-DtD_vec)
+  
+  # Combine results into a data frame
+  results <- data.frame(
+    conm = df$conm,
+    fyear = df$fyear,
+    DtD = DtD_vec,
+    P_default = P_default_vec,
+    iterations = iterations_vec
+  )
+  
+  return(results)
+}
+
+# Apply the vectorized function
+all_results_vectorized <- calc_all_probabilities_vectorized(df_DtD)
+
+# Preview the results
+head(all_results_vectorized)
+```
+
+As before we calculate the ROC curve and AUC measure
+
+```{r}
+
+# we add the actual Y's to our predicted probabilities
+merged_results <- all_results_vectorized %>%
+  left_join(select(df_DtD, conm, fyear, Y), by = c("conm", "fyear"))
+
+# Calculating our ROC curve
+roc_curve <- roc(merged_results$Y, merged_results$P_default)
+
+# Optimal cutoff
+optimal_cutoff <- coords(roc_curve, "best", ret = "threshold")
+# Redefining our Y prediction to be 1 or 0 for confusion matrix
+predicted_class <- ifelse(merged_results$P_default >= optimal_cutoff[,1], 1, 0)
+
+# Confusion matrix
+confusionMatrix(as.factor(as.vector(predicted_class)), as.factor(merged_results$Y))
+
+# Plotting ROC curve and calculating AUC
+plot(roc_curve,
+     xlim = c(1,0),
+     ylim = c(0,1),
+     asp = 1,
+     main = "ROC Curve: DtD Model")
+auc(roc_curve)
+
+cat("Optimal cut off:", optimal_cutoff[,1])
+```
+
+The iterative Distance-to-Default (DtD) model achieved an AUC of $0.5109$, slightly better than the standard DtD model ($0.5032$) but still significantly below both the transformed Altman model under time-dependent cross-validation ($0.5363$) and standard train-test evaluation ($0.8595$). The model's balanced accuracy of $45.1\%$ reflects weak classification performance, with sensitivity ($51.7\%$) and specificity ($38.5\%$) remaining low.
+
+While the iterative approach slightly improves on the standard DtD model, it continues to struggle with a high number of false positives ($60,426$) and a limited ability to identify true positives ($136$). These results highlight the iterative DtD model's limitations in default prediction compared to other methods, particularly the transformed Altman model, which shows superior performance across multiple evaluation settings.
+
+# Conclusion
+
+The analysis evaluates various predictive models for default risk using data from WRDS (Compustat, CRSP) and Lopucki, incorporating methods such as LASSO regression, random forests, logistic regression (Altman), and Distance-to-Default (DtD) models. LASSO regression effectively simplifies the model by selecting the most significant variables, demonstrating interpretability and efficiency with an AUC of $0.8133$, although it struggles with non-linear relationships. Weighting improved its ability to address class imbalance, raising the AUC to $0.9041$ and reducing false negatives significantly. Random forests, which excel at capturing complex, non-linear interactions, achieved the highest AUC of $0.9401$ but generated a substantial number of false positives due to the low threshold for default probability ($0.3 \%$), limiting its practical applicability despite strong predictive performance.
+
+The Altman model, while theoretically grounded, highlighted challenges posed by imbalanced data. Incorporating weighting improved its AUC to $0.8922$, yet it remained prone to false positives, with substantial differences in performance between static train-test splits and time series cross-validation. Time-dependent evaluation underscored the impact of temporal structure in financial data, revealing more realistic yet lower metrics, such as an AUC of $0.5363$, reflecting the difficulty of generalising across time.
+
+Distance-to-Default models, including both naive and iterative approaches, provided insights into financial health but underperformed compared to other methods, with AUCs of $0.5032$ and $0.5109$ respectively. While the iterative DtD model better adhered to the Merton framework, its predictive accuracy remained limited, reinforcing the complexity of capturing default risk in such frameworks. Overall, models such as weighted LASSO and random forests offered stronger predictive capabilities, but the challenges of imbalanced datasets, temporal dependencies, and non-linear relationships highlighted the need for robust validation and hybrid approaches to optimise predictive accuracy in this context.
+
+## Table: Performance comparison of different models
+
+::: {#tbl-model-comparison}
+| Model           | AUC   | Sensitivity | Specificity | Balanced Accuracy |
+|-----------------|-------|-------------|-------------|-------------------|
+| Weighted LASSO  | 0.904 | 0.89        | 0.85        | 0.87              |
+| Random Forest   | 0.940 | 0.92        | 0.80        | 0.86              |
+| Altman (TSCV)   | 0.536 | 0.74        | 0.29        | 0.54              |
+| DtD (Iterative) | 0.511 | 0.52        | 0.39        | 0.45              |
+:::
+
+# References
+
+1.  Altman, E. I. (1968). Financial Ratios, Discriminant Analysis, and the Prediction of Corporate Bankruptcy. *The Journal of Finance, 23*(4), 589–609. <https://doi.org/10.2307/2978933>
+
+2.  Tibshirani, R. (1996). Regression Shrinkage and Selection via the Lasso. *Journal of the Royal Statistical Society: Series B (Methodological), 58*(1), 267–288.
+
+3.  Breiman, L. (2001). Random Forests. *Machine Learning, 45*(1), 5–32. <https://doi.org/10.1023/A:1010933404324>
+
+4.  Bharath, S. T., & Shumway, T. (2008). Forecasting Default with the Merton Distance to Default Model. *Review of Financial Studies, 21*(3), 1339–1369. <https://doi.org/10.1093/rfs/hhn044>
+
+5.  Hastie, T., Tibshirani, R., & Friedman, J. (2009). \*The Elements of Statistical Learning: Data Mining, Inference, and Prediction\* (2nd ed.). Springer. https://doi.org/10.1007/978-0-387-84858-7
